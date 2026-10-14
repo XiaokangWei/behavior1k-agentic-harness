@@ -75,6 +75,9 @@ DEFAULT_CONFIG = {
                                    # burned 3600 steps; the 4th, converging one,
                                    # then ran out of episode)
     "explore_amp": 0.05,
+    "explore_stall_cap": 5,        # explore calls w/o a new J-column -> force partial-J servo
+                                   # (int301-g aim#1: joint stuck at limit -> explore looped on the
+                                   #  same dead joint for 15 calls, err frozen at 0.56, whole aim wasted)
     "arm_side_margin": 0.12,       # target |y| beyond this -> use that side's arm
     "close_calls": 10,             # harness-driven close window after arrival (x20 steps)
     "close_retries": 2,            # empty close -> descend target & re-grasp, same aim
@@ -92,6 +95,28 @@ DEFAULT_CONFIG = {
     "z_max": 0.95,                  # floor blobs (0.0-0.3) and head-height furniture
                                    # (1.0+) are unreachable or not toys
     "far_cooldown": 600,           # steps to wait when the perceived target is out of reach
+    # ---- v9 base approach (int301-h/i: the VLA parks 1.3-3.1m from every toy and
+    #      never closes the distance; the arm cannot reach past 0.85m, so when the
+    #      watchdog fires and ALL toys are far, drive the base to the nearest one) ----
+    "approach_enabled": True,
+    "approach_max_h": 3.0,         # consider far toy candidates up to this horizontal distance
+    "approach_gain": 0.8,          # base action scale; action = normalized velocity cmd
+                                   # (int301-i calibration: ~0.58 m/s per unit x, ~0.78 y)
+    "approach_budget": 25,         # re-plans max per approach (~17s; ~9m at full command)
+    "approach_done_h": 0.62,       # handed off to aim servo once this close (arm dexterity
+                                   # margin: in-reach aims stalled at 0.15-0.38 err even at 0.5-0.68)
+    "approach_min_v": 0.03,        # |base velocity| below this while commanding motion = blocked
+    "approach_stall_chunks": 3,    # consecutive blocked chunks -> abort approach
+    "approach_miss_limit": 8,      # consecutive perception misses while driving -> abort
+    "approach_jump_r": 0.4,        # reject re-localizations suddenly this much FARTHER (furniture blob)
+    "fumble_escalate": 4,          # same-position eef-rejected in-reach blobs seen this many triggers -> rescue aim
+    "fumble_r": 0.2,              # same-fumble-position radius (m)
+    "pan_enabled": True,          # v10: servo trunk t4 (head yaw) during approach to keep the target in FoV
+    "pan_gain": 0.8,              # pan servo gain on (target bearing - camera yaw)
+    "pan_max_step": 0.15,         # max pan move per chunk (rad)
+    "z_toy_lo": 0.45,             # v10: strict toy z-band -- candidates inside get priority (furniture sits at the wide band edges)
+    "z_toy_hi": 0.85,
+    "z_toy_pen": 1.5,             # cost penalty (m) for far candidates outside the strict toy z-band
     # ---- yield ----
     "yield_steps": 1500,           # after aim: hands-off window for the VLA
     "yield_fail_steps": 800,       # shorter hand-back when the aim clearly failed
@@ -305,13 +330,22 @@ class R9Harness:
         self.no_attempt_steps = 0
         self.target_blacklist = []
         self.aim_got_grasp = False
-        self.phase = "idle"          # idle | aim | close | yield
+        self.phase = "idle"          # idle | approach | aim | close | yield
         self.aim_target = None
         self.aim_arm = "l"
         self.aim_budget = 0
         self.aim_dist0 = None
         self.aim_best_err = None
         self.aim_err_hist = []
+        # v9 approach state
+        self.approach_target = None
+        self.approach_dist = None
+        self.fumble_loc = None       # v9.2: last eef-rejected in-reach blob position
+        self.fumble_count = 0
+        self.approach_budget = 0
+        self.approach_misses = 0
+        self.approach_stall = 0
+        self.approach_dist_last = None
         self.close_left = 0
         self.close_retries = 0
         self.close_hist = []
@@ -474,7 +508,12 @@ class R9Harness:
             ray_mode = self.cfg.get("depth_mode", "ray") == "ray"
 
             cands = []
+            far_cands = []      # v9: candidates that pass ALL toy gates but are
+                                # beyond arm reach -- the base can drive to them
+            eef_cands = []      # v9.2: pass EVERY gate except anti-stuck EEF, IN
+                                # REACH -- the VLA is fumbling a toy at its gripper
             far = 0
+            rej = {}
             bl = self.target_blacklist
             bl_r = float(self.cfg.get("blacklist_r", 0.35))
             el, er = self._extract_eef(obs)
@@ -493,23 +532,46 @@ class R9Harness:
                 # anti-"stuck-against" gate: when the VLA is wedged against
                 # furniture, the nearest warm blob IS that furniture. Reject
                 # candidates within eef_min_dist of either EEF.
-                if eefs and eef_min > 0:
-                    if any(float(np.linalg.norm(p_loc - e)) < eef_min for e in eefs):
-                        far += 1
-                        continue
-                # reachability on the HORIZONTAL plane (the arm works above the
-                # floor; a 3D norm from the base origin misjudges table targets)
-                reach_h = float(np.linalg.norm(p_loc[:2]))
-                if not (self.cfg["reach_h_min"] <= reach_h <= self.cfg["reach_h_max"]):
-                    far += 1
-                    continue
+                eef_reject = bool(eefs) and eef_min > 0 and any(
+                    float(np.linalg.norm(p_loc - e)) < eef_min for e in eefs)
                 if not (self.cfg["z_min"] <= p_loc[2] <= self.cfg["z_max"]):
+                    rej["z"] = rej.get("z", 0) + 1
                     far += 1
                     continue
                 if bl and any(float(np.linalg.norm(p_loc - bp)) < bl_r for bp in bl):
+                    rej["bl"] = rej.get("bl", 0) + 1
                     far += 1
                     continue
-                cands.append((p_loc, b))
+                # reachability on the HORIZONTAL plane (the arm works above the
+                # floor; a 3D norm from the base origin misjudges table targets).
+                # v9: past reach_h_max but within approach_max_h = approach candidate.
+                reach_h = float(np.linalg.norm(p_loc[:2]))
+                if self.cfg["reach_h_min"] <= reach_h <= self.cfg["reach_h_max"]:
+                    if eef_reject:
+                        # v9.2 fumble candidate: passes EVERY gate except the
+                        # anti-stuck EEF one, and sits IN REACH. Usually the
+                        # VLA is fumbling a real toy right at its own gripper
+                        # (int301-k: the same in-reach blob was eef-rejected
+                        # 12x straight while the harness idled in cooldown).
+                        eef_cands.append((reach_h, p_loc))
+                        rej["eef"] = rej.get("eef", 0) + 1
+                        far += 1
+                        continue
+                    cands.append((p_loc, b))
+                    continue
+                if (reach_h > self.cfg["reach_h_max"]
+                        and reach_h <= float(self.cfg.get("approach_max_h", 3.0))
+                        and bool(self.cfg.get("approach_enabled", True))):
+                    far_cands.append((reach_h, p_loc, b))
+                    rej["reach"] = rej.get("reach", 0) + 1
+                elif reach_h < self.cfg["reach_h_min"]:
+                    rej["near"] = rej.get("near", 0) + 1
+                else:
+                    rej["reach"] = rej.get("reach", 0) + 1
+                far += 1
+                continue
+            if rej:
+                info["rej"] = rej
 
             if not cands and bl:
                 # every candidate is blacklisted: retry the OLDEST blacklisted
@@ -524,14 +586,36 @@ class R9Harness:
                 # navigate closer and the target becomes actionable)
                 info["err"] = "target_far" if far else "no_valid_blob"
                 info["n_far"] = far
+                if far_cands:
+                    # v10.1: strict toy z-band priority -- furniture edges at
+                    # the wide band edges monopolized approach targets
+                    # (j/k/l/m: z 0.356~0.941 all furniture, true toys 0.50~0.81)
+                    zl, zh = float(self.cfg.get("z_toy_lo", 0.45)), float(self.cfg.get("z_toy_hi", 0.85))
+                    zp = float(self.cfg.get("z_toy_pen", 1.5))
+                    far_cands.sort(key=lambda c: c[0] + (0.0 if zl <= c[1][2] <= zh else zp))
+                    info["far_cands"] = [
+                        (c[0], [round(float(x), 3) for x in c[1]], c[2]) for c in far_cands
+                    ]
+                if eef_cands:
+                    eef_cands.sort(key=lambda c: c[0])
+                    info["eef_cands"] = [
+                        (c[0], [round(float(x), 3) for x in c[1]]) for c in eef_cands
+                    ]
                 return None, info
 
             # NOTE: EEF proximity already filtered above (anti stuck-against);
-            # rank survivors by closeness to the nearest EEF (actionable first)
-            if eefs:
-                cands.sort(key=lambda cb: min(float(np.linalg.norm(cb[0] - e)) for e in eefs))
-            else:
-                cands.sort(key=lambda cb: -cb[1]["px"])
+            # v10.1: strict toy z-band is the PRIMARY ranking key (in-band
+            # candidates beat all out-of-band ones regardless of size/nearness
+            # -- int301-m: a 645px furniture rim at z=0.91 beat every real toy)
+            zl, zh = float(self.cfg.get("z_toy_lo", 0.45)), float(self.cfg.get("z_toy_hi", 0.85))
+            def _rank(cb):
+                in_band = zl <= cb[0][2] <= zh
+                if eefs:
+                    near = min(float(np.linalg.norm(cb[0] - e)) for e in eefs)
+                else:
+                    near = -cb[1]["px"] / 1000.0
+                return (0 if in_band else 1, near)
+            cands.sort(key=_rank)
             p_loc, b = cands[0]
             info["target"] = [round(float(x), 3) for x in p_loc]
             info["target_blob"] = b
@@ -608,6 +692,8 @@ class R9Harness:
 
         # 2. gripper events from previous chunk's command vs current width
         row = {
+            "bq": [round(float(st[0]), 3), round(float(st[1]), 3), round(float(st[2]), 3)],
+            "ba": [round(float(x), 3) for x in np.median(act[:, 0:3], axis=0)],
             "step": self.step,
             "stage": int(stage),
             "best": self.best_stage,
@@ -702,6 +788,9 @@ class R9Harness:
                 self.aim_got_grasp = False
             return None
 
+        if self.phase == "approach":
+            return self._approach_step(st, act, el, er, obs, row)
+
         if self.phase == "close":
             return self._close_step(st, act, el, er, row)
 
@@ -731,11 +820,50 @@ class R9Harness:
 
         tgt, pinfo = self._perceive(obs)
         row["blobs"] = pinfo.get("blobs", [])[:3]
+        if pinfo.get("rej"):
+            row["rej"] = pinfo["rej"]
         if tgt is None:
             err = pinfo.get("err", "")
             if err == "target_far":
-                # perceived but out of arm reach: cool down, do NOT burn a fail
-                # credit -- the VLA may navigate closer and make it actionable
+                fc = pinfo.get("far_cands") or []
+                ec = pinfo.get("eef_cands") or []
+                # v9.2 fumble rescue: the SAME in-reach position keeps failing
+                # ONLY the anti-stuck EEF gate -> the VLA is fumbling a real
+                # toy at its own gripper (int301-k: 12x same-blob cooldowns,
+                # 7000 steps of idle). Take over after fumble_escalate hits.
+                if ec and self.n_interventions < self.cfg["max_interventions"]:
+                    p_f = np.asarray(ec[0][1], dtype=float)
+                    if self.fumble_loc is not None and \
+                            float(np.linalg.norm(p_f[:2] - self.fumble_loc[:2])) <= float(self.cfg.get("fumble_r", 0.2)):
+                        self.fumble_count += 1
+                    else:
+                        self.fumble_loc = p_f.copy()
+                        self.fumble_count = 1
+                    row["fumble"] = self.fumble_count
+                    if self.fumble_count >= int(self.cfg.get("fumble_escalate", 4)):
+                        row["evt"] = "fumble_rescue"
+                        row["ptarget"] = ec[0][1]
+                        logger.info(
+                            f"R9H: fumble rescue -> aim at eef-gated in-reach blob "
+                            f"{ec[0][1]} (seen {self.fumble_count}x) step={self.step}"
+                        )
+                        self.fumble_count = 0
+                        self.n_interventions += 1
+                        self._begin_aim(p_f, el, er, row)
+                        return self._aim_step(st, act, el, er, row)
+                elif not ec:
+                    # nothing eef-gated this trigger: let a stale streak decay
+                    self.fumble_count = max(0, self.fumble_count - 1)
+                if (fc and bool(self.cfg.get("approach_enabled", True))
+                        and self.n_interventions < self.cfg["max_interventions"]):
+                    # v9: every actionable toy is beyond arm reach (int301-h/i:
+                    # VLA parks 1.3-3.1m out and never closes the distance) --
+                    # drive the base to the nearest far candidate, then aim.
+                    self._begin_approach(fc[0][1], row)
+                    return self._approach_step(st, act, el, er, obs, row)
+                # no far candidate in approach range (or approach off): cool
+                # down, do NOT burn a fail credit -- the VLA may navigate
+                # closer and make it actionable
                 self.far_cooldown_left = int(self.cfg["far_cooldown"])
                 row["evt"] = "target_far_cooldown"
                 row["perr"] = err
@@ -754,6 +882,13 @@ class R9Harness:
                             f"-> retry in {self.cfg.get('perception_retry_cooldown', 600)} steps")
             return None
 
+        self.n_interventions += 1
+        self._begin_aim(tgt, el, er, row)
+        return self._aim_step(st, act, el, er, row)
+
+    def _begin_aim(self, tgt, el, er, row):
+        """Set up a fresh aim at an in-reach target. Caller increments
+        n_interventions (approach -> aim handoff stays one intervention)."""
         off = np.asarray(self.cfg["pre_grasp_offset"], dtype=float).copy()
         off[2] = self.hover_z    # loop-level adaptation: descends after empty closes
         self.aim_target = np.asarray(tgt, dtype=float) + off
@@ -773,10 +908,12 @@ class R9Harness:
         self.aim_best_err = None
         self.aim_err_hist = []
         self.close_retries = 0
+        self.aim_kn_last = int(self.ctrl[self.aim_arm].known.sum())
+        self.aim_explore_stall = 0
         self.aim_dist0 = min(dl, dr)
         self.phase = "aim"
-        self.n_interventions += 1
-        row["evt"] = "aim_start"
+        if "evt" not in row:      # keep fumble_rescue / approach_arrived visible
+            row["evt"] = "aim_start"
         row["arm"] = self.aim_arm
         row["aim_target"] = [round(float(x), 3) for x in self.aim_target]
         logger.info(
@@ -784,7 +921,168 @@ class R9Harness:
             f"target={np.round(self.aim_target, 3).tolist()} dist0={self.aim_dist0:.3f} "
             f"dwell={self.dwell} empty_sp={self.empty_since_progress} step={self.step}"
         )
-        return self._aim_step(st, act, el, er, row)
+        return None
+
+    def _begin_approach(self, p_loc, row):
+        """v9: enter the base-drive phase toward a far toy candidate."""
+        self.approach_target = np.asarray(p_loc, dtype=float).copy()
+        self.approach_dist = float(np.linalg.norm(np.asarray(p_loc, dtype=float)[:2]))
+        self.approach_budget = int(self.cfg["approach_budget"])
+        self.approach_misses = 0
+        self.approach_stall = 0
+        self.approach_dist_last = None
+        self.phase = "approach"
+        self.n_interventions += 1
+        row["evt"] = "approach_start"
+        row["approach_target"] = [round(float(x), 3) for x in self.approach_target]
+        logger.info(
+            f"R9H: approach #{self.n_interventions} start | far_target="
+            f"{np.round(self.approach_target, 3).tolist()} "
+            f"reach_h={np.linalg.norm(self.approach_target[:2]):.2f} step={self.step}"
+        )
+
+    def _approach_step(self, st, act, el, er, obs, row):
+        """v9: drive the base toward a toy beyond arm reach. int301-h/i forensics:
+        the VLA wanders but parks 1.3-3.1m from every toy, so the 0.85m arm can
+        never touch anything and every aim/trigger dies as target_far. Base
+        action = normalized velocity command (int301-i calibration: ~0.58 m/s
+        per unit x, ~0.78 y, rz 1.18 rad/s). Arms frozen, grippers open."""
+        # 1. re-perceive: as the base moves, re-localize the target; also the
+        #    only way to detect arrival (target enters arm reach).
+        tgt, pinfo = self._perceive(obs)
+        if tgt is not None:
+            rh = float(pinfo.get("reach_h", self.cfg["reach_h_max"]))
+            if rh <= float(self.cfg.get("approach_done_h", 0.62)):
+                row["evt"] = "approach_arrived"
+                row["ptarget"] = pinfo.get("target")
+                logger.info(
+                    f"R9H: approach done (reach_h={rh:.2f}) -> target in reach "
+                    f"{np.round(pinfo.get('target', []), 3).tolist()} at step={self.step}"
+                )
+                self._begin_aim(tgt, el, er, row)   # same intervention, no +1
+                return self._aim_step(st, act, el, er, row)
+            # crossed into arm reach but still outside the dexterity sweet spot
+            # (in-reach aims stalled at 0.15-0.38 err on int301-i): keep closing
+            self.approach_target = np.asarray(tgt, dtype=float).copy()
+            self.approach_dist = rh
+            self.approach_misses = 0
+            row["approach_dist"] = round(rh, 3)
+        else:
+            fc = pinfo.get("far_cands") or []
+            accepted = False
+            if fc:
+                # v9.1: prefer the candidate closest to the CURRENT estimate,
+                # not raw-nearest -- following nearest-dist alone chases warm
+                # furniture blobs (int301-j: dist 0.87 -> 1.10 -> 2.16 zig-zag)
+                # v10: candidates inside the STRICT toy z-band [0.45,0.85] get
+                # priority -- all 4 approach targets across j/k/l sat at the
+                # wide band's edges (z .93/.39/.36/.89) = furniture; real
+                # toys live at z 0.50-0.81 (int301-i telemetry)
+                prev = np.asarray(self.approach_target, dtype=float)
+                z_lo = float(self.cfg.get("z_toy_lo", 0.45))
+                z_hi = float(self.cfg.get("z_toy_hi", 0.85))
+                z_pen = float(self.cfg.get("z_toy_pen", 1.5))
+                best, best_cost = None, None
+                for d_c, p_c, _b in fc:
+                    pc = np.asarray(p_c, dtype=float)
+                    cost = d_c + 0.5 * float(np.linalg.norm(pc[:2] - prev[:2]))
+                    if not (z_lo <= pc[2] <= z_hi):
+                        cost += z_pen
+                    if best_cost is None or cost < best_cost:
+                        best, best_cost = (d_c, p_c), cost
+                d_new, p_new = best
+                # jump-away gate: a re-localization suddenly much FARTHER than
+                # the last accepted one is a different (furniture) blob -- keep
+                # dead-reckoning toward the current estimate instead of chasing.
+                # v10: inside 0.7m the estimate is LOCKED (gate tightens to 0.25)
+                if self.approach_dist is None:
+                    gate = float(self.cfg.get("approach_jump_r", 0.4))
+                else:
+                    gate = 0.25 if self.approach_dist <= 0.7 else float(self.cfg.get("approach_jump_r", 0.4))
+                if self.approach_dist is None or d_new <= self.approach_dist + gate:
+                    self.approach_target = np.asarray(p_new, dtype=float).copy()
+                    self.approach_dist = d_new
+                    self.approach_misses = 0
+                    row["approach_dist"] = round(d_new, 3)
+                    accepted = True
+            if not accepted:
+                self.approach_misses += 1
+                row["approach_miss"] = self.approach_misses
+                if self.approach_misses > int(self.cfg["approach_miss_limit"]):
+                    # lost the target while driving (head fixed, FoV drift): hand
+                    # back to the VLA -- do NOT blacklist, the toy is still there
+                    self.phase = "yield"
+                    self.yield_left = int(self.cfg["yield_fail_steps"])
+                    self.far_cooldown_left = int(self.cfg["far_cooldown"])
+                    row["evt"] = "approach_lost"
+                    logger.info(f"R9H: approach lost target after {self.approach_misses} misses -> yield")
+                    return None
+        # 2. budget
+        self.approach_budget -= 1
+        if self.approach_budget <= 0:
+            self.phase = "yield"
+            self.yield_left = int(self.cfg["yield_fail_steps"])
+            self.far_cooldown_left = int(self.cfg["far_cooldown"])
+            row["evt"] = "approach_budget_out"
+            logger.info("R9H: approach budget out -> yield (no blacklist)")
+            return None
+        # 3. blocked detector: commanding motion but the base barely moves ->
+        #    wedged on furniture; abort rather than burn the whole budget
+        dist = float(np.linalg.norm(self.approach_target[:2]))
+        cmd = float(self.cfg["approach_gain"])
+        v = float(np.linalg.norm(st[0:2]))
+        if v < float(self.cfg["approach_min_v"]) and dist > 0.1:
+            self.approach_stall += 1
+        else:
+            self.approach_stall = 0
+        if self.approach_stall >= int(self.cfg["approach_stall_chunks"]):
+            self.phase = "yield"
+            self.yield_left = int(self.cfg["yield_fail_steps"])
+            self.far_cooldown_left = int(self.cfg["far_cooldown"])
+            row["evt"] = "approach_blocked"
+            logger.info(f"R9H: approach blocked (|v|={v:.3f} for {self.approach_stall} chunks) -> yield")
+            return None
+        # 4. drive: body-frame unit vector toward the target x approach_gain.
+        #    No yaw control needed -- holonomic base translates sideways fine.
+        row["approach_step"] = self.approach_budget
+        dist = max(dist, 1e-6)
+        out = np.tile(st, (act.shape[0], 1))
+        out[:, 0] = (self.approach_target[0] / dist) * cmd
+        out[:, 1] = (self.approach_target[1] / dist) * cmd
+        out[:, 2] = 0.0
+        # v10: head-pan servo. Trunk t4 (action dim 6) is a pure yaw joint
+        # (URDF axis z) carrying the zed camera; as the base translates the
+        # target drifts out of the FoV and re-localization destabilizes
+        # (j/k/l: all 4 approaches died to FoV loss). Servo the CAMERA's actual
+        # optical-axis yaw (from the live cam pose -- no sign guesswork) toward
+        # the target bearing; pitch joints stay frozen at their current qpos.
+        pan_cmd = float(st[6])
+        if bool(self.cfg.get("pan_enabled", True)):
+            try:
+                cam7 = self._cam_pose7(obs)
+                if cam7 is not None:
+                    q = cam7[3:7]
+                    if self.cfg.get("quat_order") == "xyzw":
+                        q = np.array([q[3], q[0], q[1], q[2]])
+                    Rc = _quat2rot(q)
+                    opt = -Rc[:, 2]                       # optical axis, body frame
+                    gamma = float(np.arctan2(opt[1], opt[0]))
+                    beta = float(np.arctan2(self.approach_target[1], self.approach_target[0]))
+                    dbeta = (beta - gamma + np.pi) % (2 * np.pi) - np.pi
+                    pan_cmd = float(st[6]) + float(np.clip(
+                        float(self.cfg.get("pan_gain", 0.8)) * dbeta,
+                        -float(self.cfg.get("pan_max_step", 0.15)),
+                        float(self.cfg.get("pan_max_step", 0.15))))
+                    pan_cmd = float(np.clip(pan_cmd, -2.5, 2.5))
+                    row["pan"] = round(pan_cmd, 3)
+                    row["dbeta"] = round(dbeta, 3)
+            except Exception:
+                pass
+        out[:, 3:6] = st[3:6]     # freeze trunk pitch joints at current qpos
+        out[:, 6] = pan_cmd
+        out[:, LEFT_GRIPPER_IDX] = 1.0
+        out[:, RIGHT_GRIPPER_IDX] = 1.0
+        return out
 
     def _aim_step(self, st, act, el, er, row):
         e = el if self.aim_arm == "l" else er
@@ -834,7 +1132,9 @@ class R9Harness:
             self.close_left = int(self.cfg["close_calls"])
             self.close_hist = []
             self.frozen_state = st.copy()
-            row["evt"] = "aim_arrived"
+            row["arrived"] = True
+            if "evt" not in row:
+                row["evt"] = "aim_arrived"
             logger.info(f"R9H: aim arrived (err {err:.3f}, d0 {self.aim_dist0:.3f}) -> "
                         f"harness close phase ({self.close_left} calls)")
             return None
@@ -843,7 +1143,22 @@ class R9Harness:
             qn = ctrl.explore(q)
             if qn is None:
                 qn = q.copy()
-            row["evt"] = "aim_explore"
+            row["evt"] = "aim_explore" if "evt" not in row else row["evt"]
+            kn = int(ctrl.known.sum())
+            if kn > self.aim_kn_last:
+                self.aim_kn_last = kn
+                self.aim_explore_stall = 0
+            else:
+                self.aim_explore_stall += 1
+                if self.aim_explore_stall >= int(self.cfg.get("explore_stall_cap", 5)):
+                    # joints that never learn (limit/blocked) lock the whole aim
+                    # in a loop (int301-g). Freeze them: zero J-columns yield
+                    # zero dq under pinv, so the servo runs on the learned subset.
+                    ctrl.known[:] = True
+                    row["evt"] = "aim_explore_force_ready"
+                    row["jkn_forced"] = kn
+                    logger.info(f"R9H: explore stalled ({kn}/{ctrl.n} cols learned) "
+                                f"-> partial-J servo")
         else:
             qn = ctrl.command(
                 q, e, self.aim_target,
@@ -852,10 +1167,14 @@ class R9Harness:
             )
             if qn is None:
                 qn = q.copy()
-            row["evt"] = "aim_step"
+            row["evt"] = "aim_step" if "evt" not in row else row["evt"]
         self.aim_budget -= 1
         row["aim_err"] = round(err, 3)
         out = np.tile(st, (act.shape[0], 1))
+        # v9 bug fix: st[0:3] is the base VELOCITY (base_qvel) -- tiling it into
+        # the action slots commands a base drift during the arm servo (the arm
+        # chases a moving target and stalls more). Command the base to STOP.
+        out[:, 0:3] = 0.0
         out[:, arm_slice] = qn
         out[:, LEFT_GRIPPER_IDX] = 1.0
         out[:, RIGHT_GRIPPER_IDX] = 1.0
@@ -931,6 +1250,7 @@ class R9Harness:
         self.close_left -= 1
         row["evt"] = "close_step"
         out = np.tile(self.frozen_state, (act.shape[0], 1))
+        out[:, 0:3] = 0.0       # v9: frozen_state[0:3] is base VELOCITY -- stop the base
         out[:, gi] = -1.0          # command this gripper closed; freeze the rest
         return out
 
