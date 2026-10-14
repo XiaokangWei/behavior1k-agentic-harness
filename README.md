@@ -64,11 +64,11 @@ version to complete a full approach chain (drive + head-pan, 0.68/-0.83 m in
 
 | run | a | b | c | d | e | f | g | h | i | j | k | l | m | n |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| q_score | .333 | .167 | .5 | .333 | .167 | .667 | .333 | 0 | 0 | .5 | .167 | .167 | .5 | (v10.1) |
+| q_score | .333 | .167 | .5 | .333 | .167 | .667 | .333 | 0 | 0 | .5 | .167 | .167 | .5 | .167 |
 | harness | v1 | v2 | v2 | v3 | v4 | v5 | v6 | v7 | v8.5 | v9 | v9.1 | v9.2 | v10 | v10.1 |
 
 Bare-policy baseline on the same instance/seed: {0.333, 0.667, 0.333}, mean 0.444.
-Intervened mean 0.295 (13 runs) — dominated by VLA variance (0–0.667), not by
+Intervened mean 0.286 (14 runs) — dominated by VLA variance (0–0.667), not by
 harm from the harness (early v1/v2 exceptions are documented in the log).
 
 ## Repo layout

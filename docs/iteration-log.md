@@ -20,7 +20,7 @@ produced by the VLA policy itself; the harness never completed a real grasp.
 | k | 0.167 | v9.1 | 12× same in-reach blob eef-gated while VLA fumbled (found) |
 | l | 0.167 | v9.2 | target "creep" 0.79 → 1.42 m across chunks; head was frozen |
 | m | 0.5 | v10 | first approach_arrived ever; pan servo works; aim plateau 0.09 m |
-| n | (final) | v10.1 | z-band candidate priority + servo_tol 0.10 |
+| n | 0.167 | v10.1 | z-band candidate priority + servo_tol 0.10; final validation run, q=0.167 (VLA self-completed without a harness grasp) |
 
 ## Failure → fix chain
 
@@ -73,3 +73,18 @@ target z=0.56; run i: residual 0.17 at full extension). The learned-Jacobian
 servo with random exploration cannot climb out. Planned but not shipped:
 analytic IK for the Panda arms using the URDF joint parameters (already
 extracted).
+
+## Finalization (2026-10-14)
+
+Iteration stopped after run n (the 14th run, v10.1). The v10.1 design — base
+approach (drive + head-pan servo) + in-reach quad-filter + toy-z candidate
+priority + fumble rescue + drive-stability gates — is the frozen harness. It is
+committed to `configs/profile_task7.json` and `r9_harness.py`, and the whole
+repo is published at https://github.com/XiaokangWei/behavior1k-agentic-harness.
+
+Honest bottom line: **the harness has not yet produced a single score point on
+its own** — every 0.0–0.667 came from VLA variance, and the bare-policy baseline
+(mean 0.444) still beats the intervened mean (0.286). The harness is a complete,
+forensically-justified intervention scaffold; turning it into a net-positive
+controller is left as future work (the analytic-IK arm servo above is the
+highest-leverage next step, since approach + perception are already solved).
