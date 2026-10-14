@@ -88,3 +88,35 @@ its own** — every 0.0–0.667 came from VLA variance, and the bare-policy base
 forensically-justified intervention scaffold; turning it into a net-positive
 controller is left as future work (the analytic-IK arm servo above is the
 highest-leverage next step, since approach + perception are already solved).
+
+## v11 — strategy-doc upgrade (2026-10-14, after finalization)
+
+User pointed the `HarnessVLA与HarnessPAI策略借鉴.md` doc at the harness and asked
+to apply it. The doc's P0 (S1 primitive decomposition + S2 scene re-grounding +
+S9 success contract) requires a capability the v10.1 loop lacked: **ground-truth
+object/box poses**. Investigation found the doc's assumption was wrong about our
+architecture — the policy runs in a *separate container* from `env`
+(`serve_b1k.py` is a websocket server; `env.task.object_scope` lives in
+`b1k-sim-r9`), so the harness cannot read GT directly. Fix: a sim-side
+`gt_injector.py` injects `obs["r9_gt"]`; the harness consumes it.
+
+Changes (all in `r9_harness.py`, gated OFF by default so v10.1 is untouched):
+- `_perceive` now delegates to `_perceive_gt` when `use_gt_poses` and `obs["r9_gt"]`
+  are present: binds the aim target to the TRUE toy pose (skips `in_box` toys,
+  ranks by true z-band + EEF proximity). Cures the "+16 cm too high" empty-close
+  and furniture-over-toy mis-rank.
+- New `transport` phase (`_begin_transport`/`_transport_step`): on a confirmed
+  grasp, carries the toy to the GT box-approach pose (Jacobian servo, base
+  zeroed, gripper CLOSED) then releases (gripper OPEN) — the doc's S1 "analytic
+  transport + release" instead of handing back to the VLA.
+- S9 guard: `hold_min_width` prevents a mid-travel gripper plateau on air from
+  counting as a grasp.
+- New `configs/profile_task7_v11.json` turns the strategy ON; `mock_test_v11.py`
+  (G1–G4) validates GT selection / approach / transport / no-GT fallback offline.
+  v9 regression suite still green (v10.1 path intact).
+
+Status: **implemented + offline-validated, NOT yet run live.** Live run requires
+(1) the running round5 sim to finish, (2) wrapping the sim env with
+`gt_injector.EnvGTInjector`, (3) deploying `profile_task7_v11.json`, (4)
+restarting `b1k-sim-r9`. Then re-run task 7 / instance 301 (the "f plan" scene)
+with the round5 ckpt to get a clean comparison vs v10.1+round5 and round5 bare.

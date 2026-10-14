@@ -121,6 +121,19 @@ DEFAULT_CONFIG = {
     "yield_steps": 1500,           # after aim: hands-off window for the VLA
     "yield_fail_steps": 800,       # shorter hand-back when the aim clearly failed
     "yield_hold_refresh": 3000,    # extend while carrying (VLA transports+places)
+    # ---- v11: ground-truth re-grounding (per HarnessVLA/HarnessPAI strategy) ----
+    # The sim-side gt_injector.py adds obs["r9_gt"] = robot-local toy/box poses.
+    # When present, the harness binds its aim/transport targets to TRUE geometry
+    # ("scene re-grounding") instead of chasing a noisy RGB-D blob or replaying a
+    # fixed displacement -- the doc's central prescription (and the cure for the
+    # int301-f "+16cm too high" empty-close and furniture-over-toy mis-rank).
+    "use_gt_poses": False,                  # require obs["r9_gt"]; RGB-D fallback if absent
+    "gt_box_offset": [0.0, 0.0, 0.18],      # pre-place pose = box center + this (local)
+    "gt_transport_tol": 0.12,               # arrive zone for the box-approach servo
+    "gt_transport_budget": 80,              # re-plans for the carry leg
+    "analytic_transport_after_grasp": False,  # S1: carry to box + release, not yield
+    "gt_inbox_proxy": 0.22,                 # local-dist proxy for "toy in box" if provider omits it
+    "hold_min_width": 0.06,                 # S9: plateau-hold must be a real grasp, not air
     # ---- perception ----
     "intrinsics": None,            # {"fx","fy","cx","cy"} -- head cam calibrated: fx=306, fy=800, cx=cy=360
     "cam_pose_idx": 2,             # index of head camera in cam_rel_poses (7-dim blocks; order l,r,head)
@@ -346,6 +359,10 @@ class R9Harness:
         self.approach_misses = 0
         self.approach_stall = 0
         self.approach_dist_last = None
+        # v11: ground-truth re-grounding / analytic transport state
+        self._gt_box_lpos = None
+        self.transport_target = None
+        self.transport_budget = 0
         self.close_left = 0
         self.close_retries = 0
         self.close_hist = []
@@ -410,7 +427,19 @@ class R9Harness:
 
     # ------------------------------------------------------------- perception
     def _perceive(self, obs):
-        """Return (target_xyz_local, info) or (None, info). Never raises."""
+        """Return (target_xyz_local, info) or (None, info). Never raises.
+
+        v11: if `use_gt_poses` and the sim injected ground-truth object/box poses
+        (obs["r9_gt"]), bind the aim target to TRUE geometry (scene re-grounding)
+        instead of the RGB-D blob. This is the Harness VLA / HarnessPAI core move
+        and fixes the "+16cm too high -> empty close" and furniture-over-toy rank
+        failures of the pure-vision path. Falls back to RGB-D when GT is absent.
+        """
+        if bool(self.cfg.get("use_gt_poses")) and obs and isinstance(obs.get("r9_gt"), dict):
+            try:
+                return self._perceive_gt(obs)
+            except Exception as e:
+                logger.warning(f"R9H: GT perceive failed ({e!r}); falling back to RGB-D")
         info = {"blobs": []}
         try:
             rgb_key, depth_key = self._head_keys(obs)
@@ -625,6 +654,86 @@ class R9Harness:
             info["err"] = repr(e)
             return None, info
 
+    def _perceive_gt(self, obs):
+        """Ground-truth re-grounding (Harness VLA S2 / HarnessPAI scene binding).
+
+        Reads obs["r9_gt"] = robot-local toy/box poses injected by the sim-side
+        gt_injector.py. Returns the SAME (target, info) contract as _perceive so
+        the approach/aim/fumble machinery is unchanged; only the perception source
+        differs. Skips toys already marked in_box (we only (re)pick unsatisfied
+        ones) and uses the true pose -> no "+16cm too high" / furniture mis-rank.
+        """
+        info = {"src": "gt"}
+        try:
+            gt = obs["r9_gt"]
+            toys = gt.get("toys") or []
+            box = gt.get("box") or {}
+            if box.get("lpos") is not None:
+                self._gt_box_lpos = np.asarray(box["lpos"], dtype=float)
+            el, er = self._extract_eef(obs)
+            eefs = [e for e in (el, er) if e is not None]
+            zl, zh = self.cfg["z_min"], self.cfg["z_max"]
+            cands, far_cands, eef_cands = [], [], []
+            eef_min = float(self.cfg.get("eef_min_dist", 0.25))
+            bl = self.target_blacklist
+            bl_r = float(self.cfg.get("blacklist_r", 0.35))
+            for t in toys:
+                p = np.asarray(t.get("lpos", (0.0, 0.0, 0.0)), dtype=float)
+                if t.get("in_box"):
+                    continue                       # satisfied toy -> skip (S3 handoff)
+                if not (zl <= p[2] <= zh):
+                    continue
+                if bl and any(float(np.linalg.norm(p - bp)) < bl_r for bp in bl):
+                    info.setdefault("rej", {})["bl"] = info.get("rej", {}).get("bl", 0) + 1
+                    continue
+                reach_h = float(np.linalg.norm(p[:2]))
+                if self.cfg["reach_h_min"] <= reach_h <= self.cfg["reach_h_max"]:
+                    eef_reject = bool(eefs) and eef_min > 0 and any(
+                        float(np.linalg.norm(p - e)) < eef_min for e in eefs)
+                    if eef_reject:
+                        eef_cands.append((reach_h, p))
+                        info.setdefault("rej", {})["eef"] = info.get("rej", {}).get("eef", 0) + 1
+                    else:
+                        cands.append((p, t))
+                elif (reach_h > self.cfg["reach_h_max"]
+                      and reach_h <= float(self.cfg.get("approach_max_h", 3.0))
+                      and bool(self.cfg.get("approach_enabled", True))):
+                    far_cands.append((reach_h, p, t))
+                else:
+                    info.setdefault("rej", {})["reach"] = info.get("rej", {}).get("reach", 0) + 1
+            zt_lo, zt_hi = float(self.cfg.get("z_toy_lo", 0.45)), float(self.cfg.get("z_toy_hi", 0.85))
+            zpen = float(self.cfg.get("z_toy_pen", 1.5))
+
+            def _rank(cb):
+                in_band = zt_lo <= cb[0][2] <= zt_hi
+                if eefs:
+                    near = min(float(np.linalg.norm(cb[0] - e)) for e in eefs)
+                else:
+                    near = -float(np.linalg.norm(cb[0][:2]))   # prefer closer to base
+                return (0 if in_band else 1, near)
+
+            cands.sort(key=_rank)
+            if cands:
+                p_loc, t = cands[0]
+                info["target"] = [round(float(x), 3) for x in p_loc]
+                info["target_toy"] = t.get("name")
+                info["reach_h"] = round(float(np.linalg.norm(p_loc[:2])), 3)
+                return p_loc, info
+            if far_cands:
+                far_cands.sort(key=lambda c: c[0] + (0.0 if zt_lo <= c[1][2] <= zt_hi else zpen))
+                info["far_cands"] = [
+                    (c[0], [round(float(x), 3) for x in c[1]], {"src": "gt"}) for c in far_cands]
+            if eef_cands:
+                eef_cands.sort(key=lambda c: c[0])
+                info["eef_cands"] = [
+                    (c[0], [round(float(x), 3) for x in c[1]]) for c in eef_cands]
+            info["err"] = "target_far" if (far_cands or eef_cands) else "no_valid_gt_toy"
+            info["n_far"] = len(far_cands)
+            return None, info
+        except Exception as e:
+            info["err"] = repr(e)
+            return None, info
+
     # ------------------------------------------------------------- gripper events
     def _update_gripper_events(self, lw, rw, row):
         events = []
@@ -794,6 +903,9 @@ class R9Harness:
         if self.phase == "close":
             return self._close_step(st, act, el, er, row)
 
+        if self.phase == "transport":
+            return self._transport_step(st, act, el, er, row)
+
         if self.phase == "aim":
             return self._aim_step(st, act, el, er, row)
 
@@ -940,6 +1052,93 @@ class R9Harness:
             f"{np.round(self.approach_target, 3).tolist()} "
             f"reach_h={np.linalg.norm(self.approach_target[:2]):.2f} step={self.step}"
         )
+
+    def _begin_transport(self, row):
+        """S1 analytic transport: carry the held toy to the box opening and release.
+
+        Entered from _close_step once a grasp is confirmed (holding). Drives the
+        SAME arm (already holding) to the box-approach pose via the learned
+        Jacobian servo; gripper stays CLOSED; base zeroed. This is the doc's
+        'analytic_transport + analytic_release' primitive that replaces handing
+        straight back to the VLA (which we observed drops the toy on the long
+        transport leg). No-op -> yield if GT box is unavailable or the feature is off.
+        """
+        if (not bool(self.cfg.get("analytic_transport_after_grasp", False))
+                or self._gt_box_lpos is None):
+            self.phase = "yield"
+            self.yield_left = int(self.cfg["yield_steps"])
+            row["evt"] = "grasp_yield_no_gt"
+            return None
+        off = np.asarray(self.cfg["gt_box_offset"], dtype=float)
+        self.transport_target = np.asarray(self._gt_box_lpos, dtype=float) + off
+        self.transport_budget = int(self.cfg["gt_transport_budget"])
+        self.phase = "transport"
+        if "evt" not in row:
+            row["evt"] = "transport_start"
+        row["transport_target"] = [round(float(x), 3) for x in self.transport_target]
+        logger.info(f"R9H: transport start -> box-approach "
+                    f"{np.round(self.transport_target, 3).tolist()} step={self.step}")
+        return None
+
+    def _transport_step(self, st, act, el, er, row):
+        """Carry the held toy to the box-approach pose (Jacobian servo on the true
+        box pose from GT), then release (open gripper) and yield. Base stays put;
+        the non-holding gripper stays open."""
+        e = el if self.aim_arm == "l" else er
+        ctrl = self.ctrl[self.aim_arm]
+        arm_slice = LEFT_ARM_IDX if self.aim_arm == "l" else RIGHT_ARM_IDX
+        gi = LEFT_GRIPPER_IDX if self.aim_arm == "l" else RIGHT_GRIPPER_IDX
+        ogi = RIGHT_GRIPPER_IDX if self.aim_arm == "l" else LEFT_GRIPPER_IDX
+        if e is None or self.transport_target is None:
+            self.phase = "yield"
+            self.yield_left = int(self.cfg["yield_steps"])
+            row["evt"] = "transport_abort_noeef"
+            return None
+        if self.transport_budget <= 0:
+            self.phase = "yield"
+            self.yield_left = int(self.cfg["yield_steps"])
+            row["evt"] = "transport_budget_out"
+            logger.info("R9H: transport budget out -> yield to VLA for place")
+            return None
+        err = float(np.linalg.norm(self.transport_target - np.asarray(e)))
+        if err <= float(self.cfg["gt_transport_tol"]):
+            self.transport_budget -= 1
+            row["evt"] = "transport_release"
+            row["transport_err"] = round(err, 3)
+            if self._gt_box_lpos is not None:
+                row["transport_box_dist"] = round(
+                    float(np.linalg.norm(self.transport_target[:2] - self._gt_box_lpos[:2])), 3)
+            out = np.tile(st, (act.shape[0], 1))
+            out[:, 0:3] = 0.0
+            out[:, arm_slice] = st[arm_slice].astype(float)
+            out[:, gi] = 1.0          # open gripper -> release the toy at the box
+            out[:, ogi] = 1.0
+            self.phase = "yield"
+            self.yield_left = int(self.cfg["yield_steps"])
+            logger.info(f"R9H: transport RELEASE at box (err {err:.3f}) -> yield")
+            return out
+        q = st[arm_slice].astype(float)
+        if not ctrl.ready:
+            qn = ctrl.explore(q)
+            if qn is None:
+                qn = q.copy()
+            row["evt"] = "transport_explore" if "evt" not in row else row["evt"]
+        else:
+            qn = ctrl.command(
+                q, e, self.transport_target,
+                gain=self.cfg["servo_gain"], max_dq=self.cfg["servo_max_dq"],
+                tol=self.cfg["gt_transport_tol"])
+            if qn is None:
+                qn = q.copy()
+            row["evt"] = "transport_step" if "evt" not in row else row["evt"]
+        self.transport_budget -= 1
+        row["transport_err"] = round(err, 3)
+        out = np.tile(st, (act.shape[0], 1))
+        out[:, 0:3] = 0.0
+        out[:, arm_slice] = qn
+        out[:, gi] = -1.0            # keep gripper CLOSED -> hold toy during carry
+        out[:, ogi] = 1.0
+        return out
 
     def _approach_step(self, st, act, el, er, obs, row):
         """v9: drive the base toward a toy beyond arm reach. int301-h/i forensics:
@@ -1232,10 +1431,15 @@ class R9Harness:
         # int301-b aim#4 showed w pinned ~0.42-0.52 with fingers on the ball)
         if (len(self.close_hist) >= 4
                 and max(self.close_hist[-4:]) - min(self.close_hist[-4:]) < 0.03
-                and w < 0.85):
+                and w < 0.85 and w >= float(self.cfg.get("hold_min_width", 0.06))):
             self.grip[side]["state"] = "holding"
             self.holding = True
             self.aim_got_grasp = True
+            # S1: carry to box + release instead of handing straight back to the
+            # VLA (which we observed drops the toy on the long transport leg).
+            if bool(self.cfg.get("analytic_transport_after_grasp", False)) and self._gt_box_lpos is not None:
+                self._begin_transport(row)
+                return None
             self.phase = "yield"
             self.yield_left = int(self.cfg["yield_steps"])
             row["evt"] = "grasp_confirm_harness"

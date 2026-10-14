@@ -41,6 +41,48 @@ proven in a real run — see `docs/iteration-log.md`):
 | Head-pan servo (trunk joint 4 yaw) | v10 | target slid out of FoV while driving |
 | Toy z-band priority in candidate ranking | v10.1 | furniture edges beat small toys |
 
+## v11 — strategy-doc upgrade (ground-truth re-grounding + analytic transport)
+
+`docs/`-side strategy doc `HarnessVLA与HarnessPAI策略借鉴.md` (mirrored from the
+can-meat harness dir) prescribes two changes that the v10.1 vision-only loop
+cannot make on its own. Both are implemented in `r9_harness.py` and gated OFF by
+default (v10.1 is the documented frozen baseline; v11 is opt-in via
+`configs/profile_task7_v11.json`):
+
+- **S2 scene re-grounding.** When the sim-side `gt_injector.py` injects
+  `obs["r9_gt"]` (robot-local toy/box poses from `env.task.object_scope`), the
+  harness binds its aim target to the **true** toy pose instead of the noisy
+  RGB-D back-projection. This directly cures the int301-f "+16 cm too high →
+  empty close" and the furniture-over-toy mis-rank that the vision path suffers.
+- **S1 analytic transport.** On a confirmed grasp the harness carries the toy to
+  the GT box-approach pose and releases (base zeroed, gripper held closed during
+  the carry) — instead of handing straight back to the VLA, which we observed
+  drops the toy on the long transport leg. This is the doc's "analytic transport
+  + release" primitive.
+
+```
+idle ──trigger──► perceive ──► [far?] ──► approach (drive base + pan head) ─┐
+                   │ (S2: GT toy pose if available, else RGB-D)              │
+                   │ [in reach]                                              ▼
+                   ▼                                                    aim (joint servo)
+           aim ──► close (gripper) ──► [grasp confirmed?]                    │
+                                        │ yes + S1 enabled                  │
+                                        ▼                                   │
+                                 transport (carry to box, gripper CLOSED) ──► release ──► yield
+                                        │ no / unsupported
+                                        ▼
+                                      yield ──► idle
+```
+
+> **Deployment caveat (important).** The policy runs in a *separate container*
+> from the environment (`serve_b1k.py` is a websocket server; `env` lives in
+> `b1k-sim-r9`). The harness therefore **cannot read `env` directly** — ground
+> truth must be injected into `obs` on the sim side (`gt_injector.py`) and flow
+> through. With `use_gt_poses=true` but **no** `r9_gt` in obs, the harness
+> silently falls back to the v10.1 RGB-D perception. So v11 also requires
+> wrapping the sim env with `gt_injector.EnvGTInjector` and restarting the sim
+> container. Validated offline in `mock_test_v11.py` (G1–G4); not yet run live.
+
 ## The two-loop tuning architecture
 
 - **Loop level (within an episode)** — `hover_adapt`: every empty close lowers
@@ -75,10 +117,12 @@ harm from the harness (early v1/v2 exceptions are documented in the log).
 
 ```
 r9_harness.py               core harness (single file, stdlib + numpy + scipy only)
-mock_test_v9.py              offline test suite (A–F): synthetic camera, full chain
+mock_test_v9.py              offline test suite (A–F): synthetic camera, full chain (v10.1 path)
+mock_test_v11.py             offline test suite (G1–G4): GT re-grounding + analytic transport (v11 path)
+gt_injector.py               sim-side obs["r9_gt"] injector (wires ground truth into the harness)
 eval_b1k_wrapper.r9.py       integration point (how the wrapper calls the harness)
 telemetry_wrapper.py         ground-truth telemetry collector (debug/forensics)
-configs/                     base config + frozen per-task profiles
+configs/                     base config + frozen per-task profiles (profile_task7.json = v10.1, _v11 = strategy)
 scripts/                     sim/policy container bring-up (eval server)
 tools/                       run forensics, calibration, plan-level tuner
 docs/                        design notes, iteration log, Q-matrix reference
@@ -110,3 +154,8 @@ python tools/tune_from_run.py harness_log.jsonl --score 0.167
    edges appear at z ≈ 0.33–0.94 and dominate size-based candidate ranking.
 4. `--instance-indices` in the evaluator takes the *index* into
    `TEST_INSTANCE_IDS` (301 = index 0), not the instance id.
+5. **Ground truth lives on the sim side, not the policy side.** The harness runs
+   inside `b1k-policy-r9`; the environment (`env.task.object_scope`) runs inside
+   `b1k-sim-r9`. To feed the harness true toy/box poses you must inject them into
+   `obs["r9_gt"]` from the sim (`gt_injector.py`) — the policy wrapper has no `env`
+   handle. This is the wiring the strategy doc assumed was free.
