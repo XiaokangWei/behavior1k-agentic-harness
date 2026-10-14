@@ -81,7 +81,9 @@ idle ──trigger──► perceive ──► [far?] ──► approach (drive 
 > through. With `use_gt_poses=true` but **no** `r9_gt` in obs, the harness
 > silently falls back to the v10.1 RGB-D perception. So v11 also requires
 > wrapping the sim env with `gt_injector.EnvGTInjector` and restarting the sim
-> container. Validated offline in `mock_test_v11.py` (G1–G4); not yet run live.
+> container. Validated offline in `mock_test_v11.py` (G1–G4) and run live on the round5
+checkpoint: **0.167** vs round5 bare **0.0** and round5+v10.1 **0.0** (see
+Results → Round5 cross-check).
 
 ## The two-loop tuning architecture
 
@@ -99,19 +101,49 @@ selected by `task_id`).
 ## Results (honest attribution)
 
 Every run's score was cross-checked against the harness event log and (where
-available) ground-truth telemetry. **All 14 scores came from the VLA itself —
-the harness has not yet completed a real toy grasp**, although v10 was the first
-version to complete a full approach chain (drive + head-pan, 0.68/-0.83 m in
-3.3 s, `approach_arrived`), and its in-reach aim converged 0.39 → 0.09 m.
+available) ground-truth telemetry. For the **r9** development loop the harness
+never produced a score point of its own — all 14 q_scores came from the VLA.
+v10 was the first version to complete a full approach chain (drive + head-pan,
+0.68/-0.83 m in 3.3 s, `approach_arrived`), and its in-reach aim converged
+0.39 → 0.09 m. The **v11** round5 run (below) is the first where the harness
+itself delivered a score point, via analytic transport.
 
 | run | a | b | c | d | e | f | g | h | i | j | k | l | m | n |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | q_score | .333 | .167 | .5 | .333 | .167 | .667 | .333 | 0 | 0 | .5 | .167 | .167 | .5 | .167 |
 | harness | v1 | v2 | v2 | v3 | v4 | v5 | v6 | v7 | v8.5 | v9 | v9.1 | v9.2 | v10 | v10.1 |
 
-Bare-policy baseline on the same instance/seed: {0.333, 0.667, 0.333}, mean 0.444.
-Intervened mean 0.286 (14 runs) — dominated by VLA variance (0–0.667), not by
-harm from the harness (early v1/v2 exceptions are documented in the log).
+Bare-policy baseline for the **r9** checkpoint on this instance/seed:
+{0.333, 0.667, 0.333}, mean 0.444. Intervened mean 0.286 (14 r9 runs) —
+dominated by VLA variance (0–0.667), not by harm from the harness (the r9
+harness triggered ~0 times and let the VLA self-score; early v1/v2 exceptions
+are documented in the log).
+
+### Round5 checkpoint cross-check (reverses an earlier wrong hypothesis)
+
+The harness was re-tested on the **round5** checkpoint
+(`pandaele/vlatmp_0924/round5_fm2048_step34680`) on the same task7/instance 301,
+one rollout each:
+
+| config | q_score | notes |
+|---|---|---|
+| round5 bare (`B1K_R9_HARNESS=0`) | **0.0** | 28336 steps, full episode — round5 is itself weak here |
+| round5 + harness v10.1 | 0.0 | arm servo 0/14 successful grasps |
+| round5 + harness v11 (GT + analytic transport) | **0.167** | aim_arrived 14, close_empty 5, grasp_confirm 0, aim_stall_abort 6 |
+
+**Earlier wrong hypothesis corrected:** a prior note claimed round5's bare score
+was 0.667 and that the harness dragged it to 0.0. That 0.667 was an **r9** bare
+run, not round5. Round5's *true* bare score is **0.0** — verified with the
+policy container confirmed on the round5 ckpt and `B1K_R9_HARNESS=0`, across a
+full 28336-step episode. So the harness did **not** destroy a good policy.
+
+**Corrected conclusion:** the harness is *benign* for the strong r9 policy
+(near-inert, scores track VLA variance) but *net-positive* for the weak round5
+policy — v11 lifts bare 0.0 → 0.167. v11 (GT re-grounding + analytic transport)
+is the variant that supplies the lift. Its autonomous arm-servo grasp is still
+0%-success (same bottleneck as v10.1), but its GT guidance + analytic transport
+deliver the one toy round5 alone cannot. **Recommendation: keep the harness
+enabled; prefer the v11 profile for weak-policy checkpoints.**
 
 ## Repo layout
 

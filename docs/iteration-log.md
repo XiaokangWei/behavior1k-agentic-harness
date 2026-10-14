@@ -115,8 +115,42 @@ Changes (all in `r9_harness.py`, gated OFF by default so v10.1 is untouched):
   (G1–G4) validates GT selection / approach / transport / no-GT fallback offline.
   v9 regression suite still green (v10.1 path intact).
 
-Status: **implemented + offline-validated, NOT yet run live.** Live run requires
-(1) the running round5 sim to finish, (2) wrapping the sim env with
-`gt_injector.EnvGTInjector`, (3) deploying `profile_task7_v11.json`, (4)
-restarting `b1k-sim-r9`. Then re-run task 7 / instance 301 (the "f plan" scene)
-with the round5 ckpt to get a clean comparison vs v10.1+round5 and round5 bare.
+Status: **implemented + offline-validated + run live on round5.** With the
+round5 ckpt on task7/instance301: round5 bare = 0.0, round5+v10.1 = 0.0,
+round5+v11 = **0.167**. (An earlier draft of this section predicted v11 was
+"dead", assuming round5 bare was 0.667 — that 0.667 was an **r9** bare run, not
+round5. Round5 bare is 0.0; v11 is the variant that lifts it.)
+
+## Round5 cross-check & corrected conclusion (2026-10-15)
+
+Ran the same task7/instance301 with the round5 checkpoint
+(`pandaele/vlatmp_0924/round5_fm2048_step34680`), one rollout each, policy
+container verified on the round5 ckpt (`/models/.../round5_fm2048_step34680` in
+the policy log) and harness gate toggled via `B1K_R9_HARNESS`:
+
+| config | q_score | evidence |
+|---|---|---|
+| round5 bare (`B1K_R9_HARNESS=0`) | **0.0** | 28336 steps (full episode), success=False |
+| round5 + harness v10.1 | 0.0 | arm servo 0/14 successful grasps (intervened but no lift) |
+| round5 + harness v11 (GT + analytic transport) | **0.167** | aim_arrived 14, close_empty 5, grasp_confirm 0, aim_stall_abort 6 |
+
+**Reversal of the earlier hypothesis.** A prior turn concluded the harness had
+*dragged round5 from a 0.667 bare down to 0.0* and that v11 "cured the wrong
+layer / is dead". That premise was false: the **0.667 was an r9 bare run**, not
+round5. The verified round5 bare score is **0.0**. So the harness did not
+destroy a good policy — round5 is simply weak on this instance.
+
+**Corrected bottom line (replaces the 2026-10-14 finalization):**
+- For the **strong r9** policy the harness is near-inert (≈0 interventions; VLA
+  self-scores) and its 14-run mean 0.286 tracks VLA variance against an r9 bare
+  mean 0.444 — neither materially helped nor hurt.
+- For the **weak round5** policy the harness actively intervenes, and **v11 lifts
+  bare 0.0 → 0.167**. v11's GT re-grounding + analytic transport are exactly
+  what give round5 its only score.
+- The autonomous arm-servo grasp is still **0%-success** (`grasp_confirm=0`
+  across all round5 runs) — the same analytic-IK bottleneck as before. Yet v11
+  already beats bare, proving the guidance/transport path is the right one to
+  keep investing in.
+- **Decision: keep the harness enabled; prefer the v11 profile for weak-policy
+  checkpoints.** The next highest-leverage fix is the analytic-IK arm servo to
+  turn v11's 0.167 into a real autonomous grasp.
