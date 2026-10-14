@@ -1,0 +1,11 @@
+# WorkBuddy session data (not code)
+.workbuddy/
+
+# Large binary / scratch
+*.pyc
+__pycache__/
+.DS_Store
+
+# Run outputs & logs stay on the eval server (never commit)
+*.jsonl
+*.log

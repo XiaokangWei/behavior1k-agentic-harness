@@ -1,0 +1,52 @@
+{
+ "mode": "intervene",
+ "tasks": [
+  7,
+  3
+ ],
+ "log_path": "/logs/r9_harness.jsonl",
+ "dwell_trigger": 3000,
+ "empty_trigger": 2,
+ "stage_min": 2,
+ "stage_max": 13,
+ "max_interventions": 8,
+ "servo_budget": 60,
+ "yield_steps": 1500,
+ "intrinsics": {
+  "fx": 306.0,
+  "fy": 800.0,
+  "cx": 360.0,
+  "cy": 360.0
+ },
+ "cam_pose_idx": 2,
+ "quat_order": "xyzw",
+ "depth_mode": "ray",
+ "mode_by_task": {
+  "7": "intervene",
+  "3": "observe"
+ },
+ "no_attempt_trigger": 1000,
+ "servo_tol": 0.07,
+ "stall_window": 15,
+ "stall_improve": 0.035,
+ "yield_fail_steps": 800,
+ "close_calls": 10,
+ "arm_side_margin": 0.12,
+ "pre_grasp_offset": [
+  0.0,
+  0.0,
+  0.03
+ ],
+ "perception_fail_limit": 12,
+ "perception_retry_cooldown": 600,
+ "z_min": 0.35,
+ "z_max": 0.95,
+ "blob_max_aspect": 3.0,
+ "blob_min_fill": 0.3,
+ "s_max": 0.55,
+ "eef_min_dist": 0.25,
+ "reach_h_max": 0.85,
+ "close_retries": 2,
+ "reapproach_budget": 15,
+ "descend_step": 0.06
+}

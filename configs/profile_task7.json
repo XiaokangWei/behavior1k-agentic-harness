@@ -1,0 +1,53 @@
+{
+ "pre_grasp_offset": [
+  0.0,
+  0.0,
+  0.03
+ ],
+ "hover_adapt": true,
+ "hover_adapt_step": 0.04,
+ "hover_min": -0.02,
+ "servo_tol": 0.07,
+ "stall_window": 15,
+ "stall_improve": 0.035,
+ "yield_fail_steps": 800,
+ "close_calls": 10,
+ "arm_side_margin": 0.12,
+ "no_attempt_trigger": 1000,
+ "servo_budget": 60,
+ "reach_h_min": 0.3,
+ "reach_h_max": 0.85,
+ "hsv_bands_deg": [
+  [
+   25,
+   40
+  ],
+  [
+   40,
+   85
+  ],
+  [
+   15,
+   25
+  ],
+  [
+   0,
+   15
+  ]
+ ],
+ "s_min": 0.4,
+ "v_min": 0.25,
+ "blacklist_r": 0.35,
+ "_provenance": "task7 v3: converged through int301-a(0.333)/b(0.167)/c(0.5); stall watchdog+close phase+hover 0.03 validated in c; hover_adapt added v4 pending int301-d",
+ "perception_fail_limit": 12,
+ "perception_retry_cooldown": 600,
+ "z_min": 0.35,
+ "z_max": 0.95,
+ "blob_max_aspect": 3.0,
+ "blob_min_fill": 0.3,
+ "s_max": 0.55,
+ "eef_min_dist": 0.25,
+ "close_retries": 2,
+ "reapproach_budget": 15,
+ "descend_step": 0.06
+}
